@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.streamlit/
+*.db
+*.sqlite
+*.xls
+*.xlsx
+*.csv
+tmp/
+temp/
+.env
