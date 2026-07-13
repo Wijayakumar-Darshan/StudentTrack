@@ -2,14 +2,30 @@
 app.py – Student Performance & Marks Management System
 Professional UI Edition – for schools and academic institutions.
 """
-import datetime, os, re, tempfile
+
+# =============================================================================
+# CRITICAL ENVIRONMENT VARIABLES – must be set before any imports
+# =============================================================================
+import os
+os.environ["MPLBACKEND"] = "Agg"
+os.environ["PANDAS_USE_PYARROW"] = "0"
+
+# =============================================================================
+# Standard imports
+# =============================================================================
+import datetime
+import re
+import tempfile
 import time
 import gc
 import io
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")  # suppress conditional formatting warnings
+
 import streamlit as st
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")          # double‑safe
 import matplotlib.pyplot as plt
 import numpy as np
 import jwt
@@ -21,20 +37,17 @@ import pdf_report
 import prediction_ai as pai
 import excel_parser
 from dotenv import load_dotenv
+import urllib.request
+import urllib.error
+import ssl
+import random
 
 # ------------------------------------------------------------------------------
-# Attempt to import reportlab; set flag if unavailable
+# PDF generation with fpdf2 (pure Python, no segfaults)
 # ------------------------------------------------------------------------------
-try:
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import inch, cm
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT
-    REPORTLAB_AVAILABLE = True
-except ImportError:
-    REPORTLAB_AVAILABLE = False
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos   # for new cell syntax
+FPDF_AVAILABLE = True
 
 load_dotenv()
 
@@ -56,9 +69,123 @@ st.set_page_config(
 
 db.init_db()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# Disable matplotlib interactive mode
+plt.ioff()
+
+# =============================================================================
+# HELPER: Get Unicode‑capable fonts (robust fallback with caching)
+# =============================================================================
+class FontNotFoundError(Exception):
+    """Raised when no suitable Unicode font can be found."""
+    pass
+
+def get_unicode_fonts():
+    """
+    Returns (regular_font_path, bold_font_path) for a Unicode‑capable font.
+    Tries to download DejaVuSans, falls back to system fonts (Arial, Segoe UI, etc.).
+    Caches paths in session state only if both files are valid and exist.
+    """
+    # Check if we have cached valid paths
+    cache_valid = (
+        "font_regular" in st.session_state and
+        "font_bold" in st.session_state and
+        st.session_state.font_regular is not None and
+        st.session_state.font_bold is not None and
+        os.path.exists(st.session_state.font_regular) and
+        os.path.exists(st.session_state.font_bold)
+    )
+    if cache_valid:
+        return st.session_state.font_regular, st.session_state.font_bold
+
+    # If cache exists but invalid, clear it
+    if "font_regular" in st.session_state:
+        del st.session_state.font_regular
+    if "font_bold" in st.session_state:
+        del st.session_state.font_bold
+
+    font_dir = tempfile.gettempdir()
+    regular_path = os.path.join(font_dir, "DejaVuSans.ttf")
+    bold_path = os.path.join(font_dir, "DejaVuSans-Bold.ttf")
+
+    # Helper to download a file with retries
+    def download_file(url, dest_path, max_retries=3):
+        ssl_context = ssl._create_unverified_context() if hasattr(ssl, '_create_unverified_context') else None
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, context=ssl_context, timeout=15) as response:
+                    with open(dest_path, 'wb') as f:
+                        f.write(response.read())
+                return True
+            except Exception:
+                time.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.5))
+        return False
+
+    # Try to download DejaVuSans from multiple mirrors
+    regular_urls = [
+        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+        "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans.ttf",
+    ]
+    bold_urls = [
+        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans-Bold.ttf",
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+        "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf",
+    ]
+
+    downloaded_regular = os.path.exists(regular_path) or any(download_file(url, regular_path) for url in regular_urls)
+    downloaded_bold = os.path.exists(bold_path) or any(download_file(url, bold_path) for url in bold_urls)
+
+    if downloaded_regular and downloaded_bold:
+        # Cache and return
+        st.session_state.font_regular = regular_path
+        st.session_state.font_bold = bold_path
+        return regular_path, bold_path
+
+    # If download failed, try system fonts
+    system_fonts = {
+        # Windows
+        "C:/Windows/Fonts/arial.ttf": "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeui.ttf": "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/tahoma.ttf": "C:/Windows/Fonts/tahomabd.ttf",
+        # Linux
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf": "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf": "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        # Mac
+        "/Library/Fonts/Arial.ttf": "/Library/Fonts/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc": None,  # no bold separate file
+    }
+
+    for reg, bold in system_fonts.items():
+        if os.path.exists(reg):
+            # If bold not found, use regular for bold (not ideal but avoids error)
+            bold_file = bold if bold and os.path.exists(bold) else reg
+            # Ensure both are valid
+            if os.path.exists(bold_file):
+                st.session_state.font_regular = reg
+                st.session_state.font_bold = bold_file
+                return reg, bold_file
+
+    # If we still have one of the DejaVu files, use it for both styles
+    if os.path.exists(regular_path):
+        st.session_state.font_regular = regular_path
+        st.session_state.font_bold = regular_path  # same for both
+        return regular_path, regular_path
+    if os.path.exists(bold_path):
+        st.session_state.font_regular = bold_path
+        st.session_state.font_bold = bold_path
+        return bold_path, bold_path
+
+    # No font found – raise error
+    raise FontNotFoundError(
+        "Could not obtain a Unicode font (DejaVuSans, Arial, or LiberationSans). "
+        "Please install a Unicode font on your system or check your internet connection."
+    )
+
+# =============================================================================
 # PROFESSIONAL UI – ENHANCED CSS (School‑grade design)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 st.markdown("""
 <style>
 /* ----- Google Fonts ----- */
@@ -385,9 +512,9 @@ div[data-testid="stAlert"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # SESSION STATE
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 if "user" not in st.session_state:
     st.session_state.user = None
 if "jwt_token" not in st.session_state:
@@ -396,6 +523,25 @@ if "form_key" not in st.session_state:
     st.session_state.form_key = 0
 if "refresh_delete" not in st.session_state:
     st.session_state.refresh_delete = False
+if "reset_student_select" not in st.session_state:
+    st.session_state.reset_student_select = False
+# Font cache – will be set by get_unicode_fonts()
+if "font_regular" not in st.session_state:
+    st.session_state.font_regular = None
+if "font_bold" not in st.session_state:
+    st.session_state.font_bold = None
+
+# Upload page persistence
+if "uploaded_file_bytes" not in st.session_state:
+    st.session_state.uploaded_file_bytes = None
+if "uploaded_file_name" not in st.session_state:
+    st.session_state.uploaded_file_name = None
+if "parsed_classes" not in st.session_state:
+    st.session_state.parsed_classes = None
+if "upload_fmt" not in st.session_state:
+    st.session_state.upload_fmt = None
+if "upload_imported_classes" not in st.session_state:
+    st.session_state.upload_imported_classes = set()
 
 def reset_form():
     st.session_state.form_key += 1
@@ -442,24 +588,47 @@ def _sidebar_user(icon, role):
         unsafe_allow_html=True
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPER: clean DataFrame for PyArrow
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# HELPER: clean DataFrame (safe, NumPy engine)
+# =============================================================================
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.astype(str)
     for col in df.columns:
         if df[col].dtype == 'object':
-            numeric = pd.to_numeric(df[col], errors='coerce')
+            numeric = pd.to_numeric(df[col], errors='coerce', downcast='float')
             if numeric.notna().mean() > 0.3:
                 df[col] = numeric
             else:
                 df[col] = df[col].astype(str).replace(['nan', 'None'], '')
     return df
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# CACHED DATABASE QUERIES (reduce memory pressure)
+# =============================================================================
+@st.cache_data(ttl=600)
+def cached_get_all_students(grade=None, stream_id=None, class_section=None):
+    return db.get_all_students(grade=grade, stream_id=stream_id, class_section=class_section)
+
+@st.cache_data(ttl=600)
+def cached_get_marks_for_student(reg_no, year=None):
+    return db.get_marks_for_student(reg_no, year=year)
+
+@st.cache_data(ttl=600)
+def cached_get_career_cutoffs(career_id):
+    return db.get_career_cutoffs(career_id)
+
+@st.cache_data(ttl=600)
+def cached_get_grade_year_averages():
+    return db.get_grade_year_averages()
+
+@st.cache_data(ttl=600)
+def cached_get_class_subject_averages(grade, class_section, year):
+    return db.get_class_subject_averages(grade, class_section, year)
+
+# =============================================================================
 # LOGIN SCREEN
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def login_screen():
     _banner("🏫", "Student Performance & Marks System", "Login as Admin or Counselling Teacher")
     c1, c2, c3 = st.columns([1, 1.2, 1])
@@ -481,129 +650,141 @@ def login_screen():
                     st.error("❌ Invalid username or password.")
         st.markdown('</div>', unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PDF GENERATION FOR STUDENT PERFORMANCE REPORT (only if reportlab available)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# PDF GENERATION FUNCTIONS (for student report and marks report)
+# =============================================================================
 def generate_student_pdf(student, avg_marks, ai_plan, ai_summary, fig1, fig2=None):
-    """
-    Generate a PDF report with student performance and AI career-readiness.
-    Returns bytes of the PDF. Raises ImportError if reportlab not installed.
-    """
-    if not REPORTLAB_AVAILABLE:
-        raise ImportError("reportlab library is not installed. Please run: pip install reportlab")
+    """Generate a PDF report using fpdf2 with Unicode support (DejaVuSans or fallback)."""
+    regular_path, bold_path = get_unicode_fonts()
+    if not os.path.exists(regular_path) or not os.path.exists(bold_path):
+        raise FontNotFoundError(f"Font files missing: reg={regular_path}, bold={bold_path}")
 
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=0.5*inch, leftMargin=0.5*inch,
-                            topMargin=0.5*inch, bottomMargin=0.5*inch)
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'TitleStyle', parent=styles['Heading1'],
-        alignment=TA_CENTER, spaceAfter=12, fontSize=18, textColor=colors.navy
-    )
-    heading_style = ParagraphStyle(
-        'HeadingStyle', parent=styles['Heading2'],
-        spaceAfter=8, textColor=colors.darkblue
-    )
-    normal_style = styles['Normal']
-    normal_style.spaceAfter = 4
+    pdf = FPDF()
+    try:
+        pdf.add_font('UniFont', '', regular_path)
+        pdf.add_font('UniFont', 'B', bold_path)
+    except Exception as e:
+        raise FontNotFoundError(f"Failed to add font: {e}") from e
 
-    story = []
+    pdf.set_font('UniFont', size=12)
+    pdf.add_page()
 
-    # Title
-    story.append(Paragraph("Student Performance Report", title_style))
-    story.append(Spacer(1, 0.2*inch))
+    # Title – bold
+    pdf.set_font('UniFont', 'B', 16)
+    pdf.cell(0, 10, "Student Performance Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.set_font('UniFont', size=12)
+    pdf.ln(5)
 
     # Student info
-    info_text = f"""
-    <b>Registration:</b> {student['reg_no']}<br/>
-    <b>Name:</b> {student['name']}<br/>
-    <b>Grade:</b> {student['grade']} {student['class_section']}<br/>
-    <b>Stream:</b> {student.get('stream_name', 'N/A')}<br/>
-    <b>Career Dream:</b> {student.get('career_name', 'None')}
-    """
-    story.append(Paragraph(info_text, normal_style))
-    story.append(Spacer(1, 0.2*inch))
+    info = (f"Registration: {student['reg_no']}\n"
+            f"Name: {student['name']}\n"
+            f"Grade: {student['grade']} {student['class_section']}\n"
+            f"Stream: {student.get('stream_name', 'N/A')}\n"
+            f"Career Dream: {student.get('career_name', 'None')}")
+    pdf.multi_cell(0, 6, info)
+    pdf.ln(5)
 
     # Average marks table
-    story.append(Paragraph("Average Marks by Subject", heading_style))
+    pdf.set_font('UniFont', 'B', 12)
+    pdf.cell(0, 8, "Average Marks by Subject", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font('UniFont', size=10)
     if avg_marks:
-        data = [["Subject", "Average Marks"]]
+        pdf.cell(80, 6, "Subject", border=1)
+        pdf.cell(40, 6, "Average Marks", border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         for subj, mark in sorted(avg_marks.items(), key=lambda x: -x[1]):
-            data.append([subj, f"{mark:.1f}"])
-        table = Table(data, colWidths=[3.5*inch, 1.5*inch])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.grey),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,0), 12),
-            ('BOTTOMPADDING', (0,0), (-1,0), 8),
-            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
-            ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ]))
-        story.append(table)
-        story.append(Spacer(1, 0.2*inch))
+            pdf.cell(80, 6, subj, border=1)
+            pdf.cell(40, 6, f"{mark:.1f}", border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(5)
 
-    # Add figure 1 (average marks bar chart)
+    # Insert figure 1 if available
     if fig1:
-        img_buffer = io.BytesIO()
-        fig1.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        story.append(Paragraph("Average Marks Chart", heading_style))
-        story.append(Image(img_buffer, width=6*inch, height=3*inch))
-        story.append(Spacer(1, 0.2*inch))
+        img_path = tempfile.mktemp(suffix=".png")
+        fig1.savefig(img_path, format='png', dpi=150, bbox_inches='tight')
+        pdf.image(img_path, x=10, w=190)
+        try:
+            os.unlink(img_path)
+        except:
+            pass
+        pdf.add_page()
 
-    # AI career readiness
+    # AI plan
     if ai_plan:
-        story.append(PageBreak())
-        story.append(Paragraph(f"AI Career-Readiness — {student.get('career_name', '')}", heading_style))
-        story.append(Paragraph(ai_summary, normal_style))
-        story.append(Spacer(1, 0.1*inch))
-
-        # Plan table
-        data2 = [["Subject", "Your Marks", "Cutoff", "Status", "Recommendation"]]
+        pdf.set_font('UniFont', 'B', 12)
+        pdf.cell(0, 8, f"AI Career-Readiness — {student.get('career_name', '')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font('UniFont', size=10)
+        pdf.multi_cell(0, 5, ai_summary)
+        pdf.ln(4)
+        pdf.cell(40, 6, "Subject", border=1)
+        pdf.cell(30, 6, "Your Marks", border=1)
+        pdf.cell(30, 6, "Cutoff", border=1)
+        pdf.cell(30, 6, "Status", border=1)
+        pdf.cell(50, 6, "Recommendation", border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         for p in ai_plan:
-            data2.append([
-                p['subject'],
-                f"{p['current']:.1f}",
-                f"{p['cutoff']:.1f}",
-                p['status'],
-                p['message']
-            ])
-        table2 = Table(data2, colWidths=[1.5*inch, 1*inch, 1*inch, 1.2*inch, 2*inch])
-        table2.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.grey),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,0), 10),
-            ('BOTTOMPADDING', (0,0), (-1,0), 6),
-            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
-            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ]))
-        story.append(table2)
-        story.append(Spacer(1, 0.2*inch))
+            pdf.cell(40, 6, p['subject'], border=1)
+            pdf.cell(30, 6, f"{p['current']:.1f}", border=1)
+            pdf.cell(30, 6, f"{p['cutoff']:.1f}", border=1)
+            pdf.cell(30, 6, p['status'], border=1)
+            pdf.cell(50, 6, p['message'], border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-        # Add figure 2 (comparison chart)
-        if fig2:
-            img_buffer2 = io.BytesIO()
-            fig2.savefig(img_buffer2, format='png', dpi=150, bbox_inches='tight')
-            img_buffer2.seek(0)
-            story.append(Paragraph("Student vs Cutoff Chart", heading_style))
-            story.append(Image(img_buffer2, width=6*inch, height=3*inch))
+    return bytes(pdf.output(dest='S'))
 
-    # Build PDF
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
+def generate_marks_pdf(student, marks_df, title):
+    """
+    Generate a PDF with a marks table for a student.
+    marks_df is a DataFrame with columns: subject_name, marks (and optionally term, year)
+    """
+    regular_path, bold_path = get_unicode_fonts()
+    if not os.path.exists(regular_path) or not os.path.exists(bold_path):
+        raise FontNotFoundError(f"Font files missing: reg={regular_path}, bold={bold_path}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# AI INSIGHT (shared) – IMPROVED VISUALISATION + PDF DOWNLOAD (if available)
-# ──────────────────────────────────────────────────────────────────────────────
+    pdf = FPDF()
+    pdf.add_font('UniFont', '', regular_path)
+    pdf.add_font('UniFont', 'B', bold_path)
+    pdf.set_font('UniFont', size=12)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font('UniFont', 'B', 16)
+    pdf.cell(0, 10, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.set_font('UniFont', size=12)
+    pdf.ln(5)
+
+    # Student info
+    info = (f"Name: {student['name']}\n"
+            f"Registration: {student['reg_no']}\n"
+            f"Grade: {student['grade']} {student['class_section']}")
+    pdf.multi_cell(0, 6, info)
+    pdf.ln(5)
+
+    # Table header
+    pdf.set_font('UniFont', 'B', 10)
+    pdf.cell(80, 6, "Subject", border=1)
+    pdf.cell(40, 6, "Marks", border=1)
+    # If available, add term/year columns
+    if 'term' in marks_df.columns:
+        pdf.cell(30, 6, "Term", border=1)
+    if 'year' in marks_df.columns:
+        pdf.cell(30, 6, "Year", border=1)
+    pdf.ln()
+
+    # Table rows
+    pdf.set_font('UniFont', size=10)
+    for _, row in marks_df.iterrows():
+        pdf.cell(80, 6, str(row['subject_name']), border=1)
+        pdf.cell(40, 6, f"{row['marks']:.1f}" if isinstance(row['marks'], (int, float)) else str(row['marks']), border=1)
+        if 'term' in marks_df.columns:
+            pdf.cell(30, 6, str(row['term']), border=1)
+        if 'year' in marks_df.columns:
+            pdf.cell(30, 6, str(row['year']), border=1)
+        pdf.ln()
+
+    return bytes(pdf.output(dest='S'))
+
+# =============================================================================
+# AI INSIGHT (shared) – IMPROVED VISUALISATION + PDF DOWNLOAD
+# =============================================================================
 def render_student_chart_and_ai(student, year_filter=None):
-    marks_rows = db.get_marks_for_student(student["reg_no"], year=year_filter)
+    marks_rows = cached_get_marks_for_student(student["reg_no"], year=year_filter)
     if not marks_rows:
         st.info("No marks recorded yet.")
         return None, None
@@ -633,7 +814,7 @@ def render_student_chart_and_ai(student, year_filter=None):
     ai_plan = ai_summary = None
     fig2 = None
     if student.get("career_id"):
-        cuts = db.get_career_cutoffs(student["career_id"])
+        cuts = cached_get_career_cutoffs(student["career_id"])
         if cuts:
             ai_plan = ai_advisor.build_improvement_plan(avg, cuts)
             ai_summary = ai_advisor.overall_summary(ai_plan)
@@ -663,40 +844,39 @@ def render_student_chart_and_ai(student, year_filter=None):
                 icon = {"On Track": "✅", "Almost There": "🟡", "Needs Improvement": "🟠", "Critical": "🔴"}[p["status"]]
                 st.write(f"{icon} **{p['subject']}** — {p['message']}")
 
-    # ---- 4. PDF Download Button (only if reportlab is available) ----
-    if REPORTLAB_AVAILABLE:
-        if st.button("📄 Download Performance Report (PDF)", key="pdf_btn"):
-            with st.spinner("Generating PDF..."):
-                try:
-                    pdf_bytes = generate_student_pdf(student, avg, ai_plan, ai_summary, fig1, fig2)
-                    st.download_button(
-                        label="⬇️ Click to download",
-                        data=pdf_bytes,
-                        file_name=f"{student['reg_no']}_performance_report.pdf",
-                        mime="application/pdf",
-                        key="pdf_download"
-                    )
-                    st.success("PDF ready for download!")
-                except Exception as e:
-                    st.error(f"Could not generate PDF: {e}")
-    else:
-        st.warning("📄 PDF report generation is disabled because 'reportlab' is not installed. "
-                   "Run `pip install reportlab` to enable this feature.")
+    # ---- 4. PDF Download Button (fpdf2) ----
+    if st.button("📄 Download Performance Report (PDF)", key="pdf_btn"):
+        with st.spinner("Generating PDF..."):
+            try:
+                pdf_bytes = generate_student_pdf(student, avg, ai_plan, ai_summary, fig1, fig2)
+                st.download_button(
+                    label="⬇️ Click to download",
+                    data=pdf_bytes,
+                    file_name=f"{student['reg_no']}_performance_report.pdf",
+                    mime="application/pdf",
+                    key="pdf_download"
+                )
+                st.success("PDF ready for download!")
+            except FontNotFoundError as e:
+                st.error(f"❌ Could not generate PDF: {e}")
+            except Exception as e:
+                st.error(f"❌ Could not generate PDF: {e}")
 
     # Close figures to free memory
     plt.close(fig1)
     if fig2:
         plt.close(fig2)
+    gc.collect()
 
     return ai_plan, ai_summary
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # AI PREDICTION PAGE (shared)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_prediction_page():
     st.header("AI Grade Performance Prediction")
     st.caption("Linear-regression model trained on all marks data. More years = better accuracy. Grades 10 & 11 are O/L critical.")
-    rows = db.get_grade_year_averages()
+    rows = cached_get_grade_year_averages()
     if not rows:
         st.warning("No marks data yet.")
         return
@@ -747,6 +927,7 @@ def render_prediction_page():
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+    gc.collect()
 
     st.subheader("Grade Trend Lines (Historical + Projected)")
     fig2, ax2 = plt.subplots(figsize=(10, 4))
@@ -769,6 +950,7 @@ def render_prediction_page():
     fig2.tight_layout()
     st.pyplot(fig2)
     plt.close(fig2)
+    gc.collect()
 
     st.subheader("Grade Details")
     table_data = [{
@@ -794,9 +976,9 @@ def render_prediction_page():
     st.download_button("Download AI Prediction Report (PDF)", pdf_b,
                        f"grade_prediction_{datetime.date.today()}.pdf", "application/pdf")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # CLASS‑WISE PERFORMANCE (shared)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_class_performance():
     st.header("Class-wise Performance")
     years = sorted({m["year"] for m in db.run_query("SELECT DISTINCT year FROM marks", fetch=True)}, reverse=True)
@@ -834,6 +1016,7 @@ def render_class_performance():
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
+        gc.collect()
 
     st.markdown("---")
     st.subheader("Drill Into a Class")
@@ -844,7 +1027,7 @@ def render_class_performance():
     sel_class = st.selectbox("Class Section", gdf2["Class"].tolist(), key="cwp_class")
     row2 = next((r for r in rows if r.get("grade") == sel_grade_int and r.get("class_section") == sel_class), None)
 
-    subj_rows = db.get_class_subject_averages(sel_grade_int, sel_class, sel_year)
+    subj_rows = cached_get_class_subject_averages(sel_grade_int, sel_class, sel_year)
     if subj_rows:
         sdf = pd.DataFrame(subj_rows)
         sdf["avg_marks"] = sdf["avg_marks"].round(2)
@@ -856,6 +1039,7 @@ def render_class_performance():
         fig3.tight_layout()
         st.pyplot(fig3)
         plt.close(fig3)
+        gc.collect()
         sdf_clean = clean_dataframe(sdf[["subject_name", "avg_marks", "n"]].rename(
             columns={"subject_name": "Subject", "avg_marks": "Avg Marks", "n": "Count"}))
         st.dataframe(sdf_clean, use_container_width=True, hide_index=True)
@@ -871,9 +1055,9 @@ def render_class_performance():
             mime="application/pdf",
         )
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # SAFE TEMP FILE DELETION
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def safe_delete_temp_file(path, max_retries=5):
     gc.collect()
     for attempt in range(max_retries):
@@ -887,9 +1071,9 @@ def safe_delete_temp_file(path, max_retries=5):
     st.warning(f"Could not delete temporary file: {path}")
     return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# EXCEL UPLOAD (shared)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# EXCEL UPLOAD (shared) – WITH PERSISTENCE
+# =============================================================================
 def render_upload_page():
     st.header("Bulk Upload Marks from Excel")
     st.markdown("""
@@ -899,70 +1083,119 @@ def render_upload_page():
     - <b>Grades 10-11</b> — O/L senior class sheets (e.g. <code>2026__grade_11_First_Term___S1.xlsm</code>)<br>
     </div>
     """, unsafe_allow_html=True)
+
+    # --- File upload widget ---
+    uploaded = st.file_uploader("Upload Excel file (.xlsx or .xlsm)",
+                                type=["xlsx", "xlsm"], key="ul_file_widget")
+
+    # If new file uploaded, store its bytes and clear previous parsed data
+    if uploaded is not None:
+        if st.session_state.uploaded_file_bytes != uploaded.getvalue() or st.session_state.uploaded_file_name != uploaded.name:
+            st.session_state.uploaded_file_bytes = uploaded.getvalue()
+            st.session_state.uploaded_file_name = uploaded.name
+            st.session_state.parsed_classes = None
+            st.session_state.upload_fmt = None
+            st.session_state.upload_imported_classes = set()
+            st.rerun()
+
+    # --- Override controls (stored in session state for persistence) ---
     col1, col2, col3 = st.columns(3)
     with col1:
-        hint_grade = st.number_input("Grade (hint, optional)", 6, 13, 8, step=1, key="ul_grade")
+        hint_grade = st.number_input("Grade hint (optional)", 6, 13, 8, step=1, key="ul_grade_hint")
     with col2:
-        override_term = st.selectbox("Term (if not in file)", ["Auto-detect", 1, 2, 3], key="ul_term")
+        override_term = st.selectbox("Term override", ["Auto-detect", 1, 2, 3], key="ul_term_override")
     with col3:
-        override_year = st.number_input("Year", 2020, 2035, 2026, step=1, key="ul_year")
-    uploaded = st.file_uploader("Upload Excel file (.xlsx or .xlsm)",
-                                type=["xlsx", "xlsm"], key="ul_file")
-    if not uploaded:
-        return
-    suffix = ".xlsm" if uploaded.name.lower().endswith(".xlsm") else ".xlsx"
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded.getbuffer())
-            tmp_path = tmp.name
-        fmt, classes = excel_parser.detect_and_parse(tmp_path, hint_grade or None)
-    except Exception as e:
-        st.error(f"Parse error: {e}")
-        return
-    finally:
-        if tmp_path:
-            safe_delete_temp_file(tmp_path)
-    if not classes:
-        st.warning("No class sheets found in file.")
-        return
-    st.success(f"Detected format: **{fmt.upper()}** | {len(classes)} class(es) found")
-    for cls_data in classes:
-        grade = cls_data.get("grade") or hint_grade
-        cls = cls_data.get("class_section", "A")
-        term = override_term if override_term != "Auto-detect" else (cls_data.get("term") or 1)
-        year = cls_data.get("year") or override_year
-        stus = cls_data.get("students", [])
-        term = int(term)
-        with st.expander(f"Grade {grade}{cls} | Term {term} {year} | {len(stus)} students", expanded=False):
-            if not stus:
-                st.info("No student rows found.")
-                continue
-            preview_df = pd.DataFrame([
-                {"Name": s["name"], "Subjects": len(s["marks"]), "Sample Marks": str(list(s["marks"].items())[:3])}
-                for s in stus[:10]
-            ])
-            st.dataframe(clean_dataframe(preview_df), use_container_width=True, hide_index=True)
-            if len(stus) > 10:
-                st.caption(f"... and {len(stus)-10} more students")
-            if st.button(f"Import Grade {grade}{cls}", key=f"imp_{grade}{cls}_{term}_{year}"):
-                imported = skipped = 0
-                with st.spinner("Importing..."):
-                    for stu in stus:
-                        try:
-                            reg_no = db.upsert_student_bulk(stu["name"], grade, cls, year)
-                            for subj_name, mark_val in stu["marks"].items():
-                                subj_id = db.get_or_create_subject(subj_name)
-                                db.save_mark(reg_no, subj_id, term, year, grade, mark_val)
-                            imported += 1
-                        except Exception as ex:
-                            st.warning(f"Skipped {stu['name']}: {ex}")
-                            skipped += 1
-                st.success(f"✅ Imported {imported} students, skipped {skipped}.")
+        override_year = st.number_input("Year override", 2020, 2035, 2026, step=1, key="ul_year_override")
 
-# ──────────────────────────────────────────────────────────────────────────────
+    # --- If we have a stored file, parse and display ---
+    if st.session_state.uploaded_file_bytes is not None:
+        file_name = st.session_state.uploaded_file_name
+        suffix = ".xlsm" if file_name.lower().endswith(".xlsm") else ".xlsx"
+
+        # Parse only once
+        if st.session_state.parsed_classes is None:
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(st.session_state.uploaded_file_bytes)
+                    tmp_path = tmp.name
+                fmt, classes = excel_parser.detect_and_parse(tmp_path, hint_grade or None)
+                safe_delete_temp_file(tmp_path)
+                st.session_state.parsed_classes = classes
+                st.session_state.upload_fmt = fmt
+            except Exception as e:
+                st.error(f"Parse error: {e}")
+                st.session_state.parsed_classes = []
+                st.session_state.upload_fmt = None
+
+        classes = st.session_state.parsed_classes
+        fmt = st.session_state.upload_fmt
+
+        if not classes:
+            st.warning("No class sheets found in file.")
+        else:
+            st.success(f"Detected format: **{fmt.upper()}** | {len(classes)} class(es) found")
+
+            # Display each class with import button
+            for idx, cls_data in enumerate(classes):
+                grade = cls_data.get("grade") or hint_grade
+                cls = cls_data.get("class_section", "A")
+                term_val = cls_data.get("term") or 1
+                if override_term != "Auto-detect":
+                    term_val = int(override_term)
+                year = cls_data.get("year") or override_year
+                stus = cls_data.get("students", [])
+                term_val = int(term_val)
+
+                # Create a unique key for this class
+                class_key = f"{grade}_{cls}_{term_val}_{year}"
+
+                with st.expander(f"Grade {grade}{cls} | Term {term_val} {year} | {len(stus)} students", expanded=False):
+                    if not stus:
+                        st.info("No student rows found.")
+                        continue
+                    preview_df = pd.DataFrame([
+                        {"Name": s["name"], "Subjects": len(s["marks"]), "Sample Marks": str(list(s["marks"].items())[:3])}
+                        for s in stus[:10]
+                    ])
+                    st.dataframe(clean_dataframe(preview_df), use_container_width=True, hide_index=True)
+                    if len(stus) > 10:
+                        st.caption(f"... and {len(stus)-10} more students")
+
+                    # Check if this class has already been imported
+                    already_imported = class_key in st.session_state.upload_imported_classes
+                    if already_imported:
+                        st.success("✅ Already imported")
+                    else:
+                        if st.button(f"Import Grade {grade}{cls}", key=f"imp_{class_key}"):
+                            imported = skipped = 0
+                            with st.spinner("Importing..."):
+                                for stu in stus:
+                                    try:
+                                        reg_no = db.upsert_student_bulk(stu["name"], grade, cls, year)
+                                        for subj_name, mark_val in stu["marks"].items():
+                                            subj_id = db.get_or_create_subject(subj_name)
+                                            db.save_mark(reg_no, subj_id, term_val, year, grade, mark_val)
+                                        imported += 1
+                                    except Exception as ex:
+                                        st.warning(f"Skipped {stu['name']}: {ex}")
+                                        skipped += 1
+                            st.success(f"✅ Imported {imported} students, skipped {skipped}.")
+                            st.session_state.upload_imported_classes.add(class_key)
+                            st.cache_data.clear()
+                            st.rerun()
+
+            # Option to clear the file
+            if st.button("🗑️ Clear uploaded file", key="clear_upload"):
+                st.session_state.uploaded_file_bytes = None
+                st.session_state.uploaded_file_name = None
+                st.session_state.parsed_classes = None
+                st.session_state.upload_fmt = None
+                st.session_state.upload_imported_classes = set()
+                st.rerun()
+
+# =============================================================================
 # ADMIN: DELETE MARKS BY GRADE & YEAR
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_delete_marks():
     st.header("🗑️ Delete Marks by Grade & Year")
     st.caption("Permanently remove all marks for a specific grade and academic year. This action cannot be undone.")
@@ -1007,14 +1240,14 @@ def render_delete_marks():
     else:
         st.info("Please confirm the deletion checkbox above to enable the delete button.")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # ADMIN: DELETE SINGLE STUDENT
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_delete_student():
     st.header("🗑️ Delete Student (Permanent)")
     st.caption("Select a student to permanently delete their record and all associated marks. This action cannot be undone.")
 
-    students = db.get_all_students()
+    students = cached_get_all_students()
     if not students:
         st.info("No students found in the database.")
         return
@@ -1042,7 +1275,7 @@ def render_delete_student():
         st.write(f"**Stream:** {student_data.get('stream_name', 'N/A')}")
         st.write(f"**Career:** {student_data.get('career_name', 'None')}")
 
-    marks = db.get_marks_for_student(reg_no)
+    marks = cached_get_marks_for_student(reg_no)
     if marks:
         st.subheader(f"Marks ({len(marks)} entries)")
         marks_df = clean_dataframe(pd.DataFrame(marks))
@@ -1065,9 +1298,9 @@ def render_delete_student():
     else:
         st.info("Please confirm the deletion checkbox above to enable the delete button.")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # ADMIN: BULK DELETE STUDENTS BY GRADE & YEAR
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_bulk_delete_students():
     st.header("🗑️ Delete Students (Bulk) by Grade & Year")
     st.caption("Permanently delete all students who have marks in the selected grade and year. This also removes all their marks.")
@@ -1143,9 +1376,9 @@ def render_bulk_delete_students():
     else:
         st.info("Please confirm the deletion checkbox above to enable the delete button.")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # ADMIN: USER MANAGEMENT
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_user_management():
     st.header("👥 User Management")
     st.caption("Create, view, edit and delete Admin / Teacher accounts")
@@ -1197,7 +1430,7 @@ def render_user_management():
         users = db.get_all_users()
         if users:
             del_sel = st.selectbox("Select user to delete", [u["username"] for u in users])
-            if st.checkbox("Confirm permanent deletion", key="del_confirm"):
+            if st.checkbox("Confirm permanent deletion", key="del_user_confirm"):
                 if st.button("Delete User", type="primary"):
                     if db.delete_user(del_sel):
                         st.success("✅ User deleted successfully.")
@@ -1206,23 +1439,30 @@ def render_user_management():
                     else:
                         st.error("❌ Could not delete user.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ADD / UPDATE STUDENT (shared for Admin & Teacher)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# ADD / UPDATE STUDENT (shared for Admin & Teacher) – FIXED
+# =============================================================================
 def render_add_update_student():
     st.header("➕ Add / Update Student")
     st.caption("Select an existing student to edit, or choose 'Add new student' to create a new record.")
 
+    # If we just saved, reset the selectbox to "Add new student"
+    if st.session_state.reset_student_select:
+        st.session_state.reset_student_select = False
+        if "student_select" in st.session_state:
+            del st.session_state["student_select"]
+        st.rerun()
+
     # Get all required data
     streams = db.get_streams()
     stream_names = [s["name"] for s in streams]
-    all_students = db.get_all_students()
+    all_students = cached_get_all_students()  # this is cached; after save we clear cache
 
     # Build options for selectbox
     student_options = ["Add new student"]
     student_options.extend([f"{s['reg_no']} - {s['name']}" for s in all_students])
 
-    selected_label = st.selectbox("Select student", student_options)
+    selected_label = st.selectbox("Select student", student_options, key="student_select")
 
     # Determine if we are editing an existing student
     selected_student = None
@@ -1238,16 +1478,11 @@ def render_add_update_student():
     default_stream = selected_student.get('stream_name') if selected_student else stream_names[0] if stream_names else ""
     default_career = selected_student.get('career_name') if selected_student else "-- none --"
 
-    # If student has a stream, filter careers; otherwise use first stream
-    if selected_student and selected_student.get('stream_id'):
-        default_stream_id = selected_student['stream_id']
-    else:
-        # if no stream, default to first stream if available
-        default_stream_id = streams[0]['id'] if streams else None
-
-    # Stream selection
+    # Stream selection (set to default_stream)
     if stream_names:
-        stream_choice = st.selectbox("Stream", stream_names, index=stream_names.index(default_stream) if default_stream in stream_names else 0)
+        # Ensure default_stream is in list
+        stream_index = stream_names.index(default_stream) if default_stream in stream_names else 0
+        stream_choice = st.selectbox("Stream", stream_names, index=stream_index)
         stream_id = db.get_stream_id(stream_choice)
         careers = db.get_careers_by_stream(stream_id)
         career_names = ["-- none --"] + [c["name"] for c in careers]
@@ -1264,9 +1499,9 @@ def render_add_update_student():
                                 index=list("ABCDEFGH").index(default_class) if default_class in "ABCDEFGH" else 0)
     grade_val = int(grade_choice.split()[1])
 
-    # Career selection
-    career_choice = st.selectbox("Career Dream", career_names,
-                                 index=career_names.index(default_career) if default_career in career_names else 0)
+    # Career selection - ensure default_career is in the list
+    career_index = career_names.index(default_career) if default_career in career_names else 0
+    career_choice = st.selectbox("Career Dream", career_names, index=career_index)
 
     # Registration No and Name (editable)
     reg_no = st.text_input("Registration Number", value=default_reg)
@@ -1277,20 +1512,23 @@ def render_add_update_student():
         if reg_no.strip() and name.strip():
             cid = None
             if career_choice != "-- none --":
-                # find career id
                 career_obj = next((c for c in careers if c["name"] == career_choice), None)
                 if career_obj:
                     cid = career_obj["id"]
             # Upsert student
             db.upsert_student(reg_no.strip(), name.strip(), grade_val, class_choice, stream_id, cid)
             st.success(f"✅ Student {reg_no} saved successfully!")
+            # Clear cache so that the select box and other pages see the updated data
+            st.cache_data.clear()
+            # Set flag to reset the select box to "Add new student"
+            st.session_state.reset_student_select = True
             st.rerun()
         else:
             st.error("❌ Registration Number and Name are required.")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # ADMIN DASHBOARD
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def admin_dashboard():
     if st.session_state.get("refresh_delete", False):
         st.session_state.refresh_delete = False
@@ -1367,7 +1605,7 @@ def admin_dashboard():
                 st.dataframe(df_c[["Career", "Stream", "Subjects w/ Cutoffs", "Students"]], use_container_width=True, hide_index=True)
                 opts = {f"{c['name']} ({c['stream_name']})": c for c in all_c}
                 sel = st.selectbox("Drill into", list(opts.keys()), key="vc")
-                rows = db.get_career_cutoffs(opts[sel]["id"])
+                rows = cached_get_career_cutoffs(opts[sel]["id"])
                 if rows:
                     df_cutoffs = clean_dataframe(pd.DataFrame(rows)[["subject_name", "min_marks"]].rename(columns={"subject_name": "Subject", "min_marks": "Cutoff"}))
                     st.dataframe(df_cutoffs, use_container_width=True, hide_index=True)
@@ -1417,7 +1655,7 @@ def admin_dashboard():
         render_upload_page()
     elif page == "📊 Student Performance":
         st.header("Student Performance Charts")
-        stus = db.get_all_students()
+        stus = cached_get_all_students()
         if not stus:
             st.info("No students yet.")
             return
@@ -1434,7 +1672,7 @@ def admin_dashboard():
         g = int(gf.split()[1]) if gf != "All" else None
         s = db.get_stream_id(sf) if sf != "All" else None
         c = cf if cf != "All" else None
-        stus = db.get_all_students(stream_id=s, grade=g, class_section=c)
+        stus = cached_get_all_students(grade=g, stream_id=s, class_section=c)
         if stus:
             st.metric("Total", len(stus))
             df_all = clean_dataframe(pd.DataFrame(stus)[["reg_no", "name", "grade", "class_section", "stream_name", "career_name"]].rename(
@@ -1454,9 +1692,9 @@ def admin_dashboard():
     else:
         st.error("Unknown page")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # TEACHER DASHBOARD
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def teacher_dashboard():
     _sidebar_user("🧑‍🏫", "Counselling Teacher")
     page = st.sidebar.radio("Navigate", [
@@ -1477,14 +1715,14 @@ def teacher_dashboard():
     stream_names = [s["name"] for s in streams]
 
     if page == "➕ Add / Update Student":
-        render_add_update_student()   # shared function
+        render_add_update_student()
     elif page == "📤 Bulk Upload Marks":
         render_upload_page()
     elif page == "📝 Enter Marks":
         st.header("Enter Marks (per Term)")
         gf2 = st.selectbox("Filter by Grade", ["All"] + [f"Grade {g}" for g in db.GRADES], key="em_gf")
         g2 = int(gf2.split()[1]) if gf2 != "All" else None
-        stus = db.get_all_students(grade=g2)
+        stus = cached_get_all_students(grade=g2)
         if not stus:
             st.info("No students found.")
             return
@@ -1503,7 +1741,7 @@ def teacher_dashboard():
         if not subs:
             st.warning("No subjects found.")
             return
-        ex = {m["subject_id"]: m["marks"] for m in db.get_marks_for_student(student["reg_no"], year=year) if m["term"] == term}
+        ex = {m["subject_id"]: m["marks"] for m in cached_get_marks_for_student(student["reg_no"], year=year) if m["term"] == term}
         with st.form(f"marks_f_{st.session_state.form_key}"):
             entries = {}
             cols = st.columns(2)
@@ -1520,7 +1758,7 @@ def teacher_dashboard():
                 st.rerun()
     elif page == "📊 Performance & AI Insight":
         st.header("Performance & AI Career-Readiness")
-        stus = db.get_all_students()
+        stus = cached_get_all_students()
         if not stus:
             st.info("No students.")
             return
@@ -1531,7 +1769,7 @@ def teacher_dashboard():
         render_class_performance()
     elif page == "⬇️ Downloadable Reports":
         st.header("Downloadable Reports")
-        stus = db.get_all_students()
+        stus = cached_get_all_students()
         if not stus:
             st.info("No students.")
             return
@@ -1543,39 +1781,71 @@ def teacher_dashboard():
             cc1, cc2 = st.columns(2)
             term = cc1.selectbox("Term", [1, 2, 3], key="rt")
             year = cc2.number_input("Year", 2000, 2100, 2026, step=1, key="ry")
-            mrows = [m for m in db.get_marks_for_student(student["reg_no"], year=year) if m["term"] == term]
+            mrows = [m for m in cached_get_marks_for_student(student["reg_no"], year=year) if m["term"] == term]
             if not mrows:
                 st.info("No marks for this term/year.")
             else:
                 df = clean_dataframe(pd.DataFrame(mrows)[["subject_name", "marks"]])
+                # Show table
                 st.dataframe(df, use_container_width=True, hide_index=True)
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    f"Download Term {term} Marks (CSV)",
-                    data=csv,
-                    file_name=f"{student['reg_no']}_term{term}_{year}.csv",
-                    mime="text/csv"
-                )
+
+
+                # PDF download (new)
+                if st.button(f"📄 Download Term {term} Marks (PDF)", key="pdf_term"):
+                    try:
+                        pdf_bytes = generate_marks_pdf(student, df, f"Term {term} Marks - {student['name']}")
+                        st.download_button(
+                            label="⬇️ Click to download PDF",
+                            data=pdf_bytes,
+                            file_name=f"{student['reg_no']}_term{term}_{year}.pdf",
+                            mime="application/pdf",
+                            key="pdf_term_download"
+                        )
+                        st.success("PDF ready for download!")
+                    except FontNotFoundError as e:
+                        st.error(f"❌ Could not generate PDF: {e}")
+                    except Exception as e:
+                        st.error(f"❌ Could not generate PDF: {e}")
         with t2:
-            all_marks = db.get_marks_for_student(student["reg_no"])
+            all_marks = cached_get_marks_for_student(student["reg_no"])
             if all_marks:
                 year_df = clean_dataframe(pd.DataFrame(all_marks))
                 st.dataframe(year_df, use_container_width=True, hide_index=True)
+
+                # CSV download
                 csv_all = year_df.to_csv(index=False)
                 st.download_button(
-                    "Download All Marks (CSV)",
+                    "📥 Download All Marks (CSV)",
                     data=csv_all,
                     file_name=f"{student['reg_no']}_all_marks.csv",
                     mime="text/csv"
                 )
+
+                # PDF download (new)
+                if st.button("📄 Download All Marks (PDF)", key="pdf_all"):
+                    try:
+                        # For all marks we include term and year columns if available
+                        pdf_bytes = generate_marks_pdf(student, year_df, f"All Marks - {student['name']}")
+                        st.download_button(
+                            label="⬇️ Click to download PDF",
+                            data=pdf_bytes,
+                            file_name=f"{student['reg_no']}_all_marks.pdf",
+                            mime="application/pdf",
+                            key="pdf_all_download"
+                        )
+                        st.success("PDF ready for download!")
+                    except FontNotFoundError as e:
+                        st.error(f"❌ Could not generate PDF: {e}")
+                    except Exception as e:
+                        st.error(f"❌ Could not generate PDF: {e}")
             else:
                 st.info("No marks found for this student.")
     elif page == "🤖 AI Grade Predictions":
         render_prediction_page()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # FOOTER (custom)
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def render_footer():
     st.markdown("""
     <div class="custom-footer">
@@ -1583,9 +1853,9 @@ def render_footer():
     </div>
     """, unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # MAIN
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def main():
     if st.session_state.get("jwt_token"):
         if not verify_jwt(st.session_state.jwt_token):
@@ -1597,7 +1867,7 @@ def main():
             admin_dashboard()
         else:
             teacher_dashboard()
-        render_footer()   # display footer on all authenticated pages
+        render_footer()
 
 if __name__ == "__main__":
     main()
