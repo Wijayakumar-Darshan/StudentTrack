@@ -1164,7 +1164,7 @@ def render_upload_page():
                     # Check if this class has already been imported
                     already_imported = class_key in st.session_state.upload_imported_classes
                     if already_imported:
-                        st.success("✅ Already imported")
+                        st.success("✅ Successfully imported")
                     else:
                         if st.button(f"Import Grade {grade}{cls}", key=f"imp_{class_key}"):
                             imported = skipped = 0
