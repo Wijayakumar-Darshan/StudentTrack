@@ -1812,15 +1812,6 @@ def teacher_dashboard():
                 year_df = clean_dataframe(pd.DataFrame(all_marks))
                 st.dataframe(year_df, use_container_width=True, hide_index=True)
 
-                # CSV download
-                csv_all = year_df.to_csv(index=False)
-                st.download_button(
-                    "📥 Download All Marks (CSV)",
-                    data=csv_all,
-                    file_name=f"{student['reg_no']}_all_marks.csv",
-                    mime="text/csv"
-                )
-
                 # PDF download (new)
                 if st.button("📄 Download All Marks (PDF)", key="pdf_all"):
                     try:
