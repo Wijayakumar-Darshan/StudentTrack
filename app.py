@@ -5,6 +5,7 @@ Professional UI Edition – for schools and academic institutions.
 import datetime, os, re, tempfile
 import time
 import gc
+import io
 import streamlit as st
 import pandas as pd
 import matplotlib
@@ -20,6 +21,21 @@ import pdf_report
 import prediction_ai as pai
 import excel_parser
 from dotenv import load_dotenv
+
+# ------------------------------------------------------------------------------
+# Attempt to import reportlab; set flag if unavailable
+# ------------------------------------------------------------------------------
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch, cm
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
 load_dotenv()
 
 SECRET_KEY = os.getenv(
@@ -442,7 +458,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LOGIN
+# LOGIN SCREEN
 # ──────────────────────────────────────────────────────────────────────────────
 def login_screen():
     _banner("🏫", "Student Performance & Marks System", "Login as Admin or Counselling Teacher")
@@ -466,7 +482,125 @@ def login_screen():
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AI INSIGHT (shared)
+# PDF GENERATION FOR STUDENT PERFORMANCE REPORT (only if reportlab available)
+# ──────────────────────────────────────────────────────────────────────────────
+def generate_student_pdf(student, avg_marks, ai_plan, ai_summary, fig1, fig2=None):
+    """
+    Generate a PDF report with student performance and AI career-readiness.
+    Returns bytes of the PDF. Raises ImportError if reportlab not installed.
+    """
+    if not REPORTLAB_AVAILABLE:
+        raise ImportError("reportlab library is not installed. Please run: pip install reportlab")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=0.5*inch, leftMargin=0.5*inch,
+                            topMargin=0.5*inch, bottomMargin=0.5*inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'TitleStyle', parent=styles['Heading1'],
+        alignment=TA_CENTER, spaceAfter=12, fontSize=18, textColor=colors.navy
+    )
+    heading_style = ParagraphStyle(
+        'HeadingStyle', parent=styles['Heading2'],
+        spaceAfter=8, textColor=colors.darkblue
+    )
+    normal_style = styles['Normal']
+    normal_style.spaceAfter = 4
+
+    story = []
+
+    # Title
+    story.append(Paragraph("Student Performance Report", title_style))
+    story.append(Spacer(1, 0.2*inch))
+
+    # Student info
+    info_text = f"""
+    <b>Registration:</b> {student['reg_no']}<br/>
+    <b>Name:</b> {student['name']}<br/>
+    <b>Grade:</b> {student['grade']} {student['class_section']}<br/>
+    <b>Stream:</b> {student.get('stream_name', 'N/A')}<br/>
+    <b>Career Dream:</b> {student.get('career_name', 'None')}
+    """
+    story.append(Paragraph(info_text, normal_style))
+    story.append(Spacer(1, 0.2*inch))
+
+    # Average marks table
+    story.append(Paragraph("Average Marks by Subject", heading_style))
+    if avg_marks:
+        data = [["Subject", "Average Marks"]]
+        for subj, mark in sorted(avg_marks.items(), key=lambda x: -x[1]):
+            data.append([subj, f"{mark:.1f}"])
+        table = Table(data, colWidths=[3.5*inch, 1.5*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,0), 12),
+            ('BOTTOMPADDING', (0,0), (-1,0), 8),
+            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+            ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 0.2*inch))
+
+    # Add figure 1 (average marks bar chart)
+    if fig1:
+        img_buffer = io.BytesIO()
+        fig1.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        story.append(Paragraph("Average Marks Chart", heading_style))
+        story.append(Image(img_buffer, width=6*inch, height=3*inch))
+        story.append(Spacer(1, 0.2*inch))
+
+    # AI career readiness
+    if ai_plan:
+        story.append(PageBreak())
+        story.append(Paragraph(f"AI Career-Readiness — {student.get('career_name', '')}", heading_style))
+        story.append(Paragraph(ai_summary, normal_style))
+        story.append(Spacer(1, 0.1*inch))
+
+        # Plan table
+        data2 = [["Subject", "Your Marks", "Cutoff", "Status", "Recommendation"]]
+        for p in ai_plan:
+            data2.append([
+                p['subject'],
+                f"{p['current']:.1f}",
+                f"{p['cutoff']:.1f}",
+                p['status'],
+                p['message']
+            ])
+        table2 = Table(data2, colWidths=[1.5*inch, 1*inch, 1*inch, 1.2*inch, 2*inch])
+        table2.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,0), 10),
+            ('BOTTOMPADDING', (0,0), (-1,0), 6),
+            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ]))
+        story.append(table2)
+        story.append(Spacer(1, 0.2*inch))
+
+        # Add figure 2 (comparison chart)
+        if fig2:
+            img_buffer2 = io.BytesIO()
+            fig2.savefig(img_buffer2, format='png', dpi=150, bbox_inches='tight')
+            img_buffer2.seek(0)
+            story.append(Paragraph("Student vs Cutoff Chart", heading_style))
+            story.append(Image(img_buffer2, width=6*inch, height=3*inch))
+
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AI INSIGHT (shared) – IMPROVED VISUALISATION + PDF DOWNLOAD (if available)
 # ──────────────────────────────────────────────────────────────────────────────
 def render_student_chart_and_ai(student, year_filter=None):
     marks_rows = db.get_marks_for_student(student["reg_no"], year=year_filter)
@@ -474,17 +608,30 @@ def render_student_chart_and_ai(student, year_filter=None):
         st.info("No marks recorded yet.")
         return None, None
     avg = ai_advisor.average_marks_by_subject(marks_rows)
-    st.subheader("Average Marks by Subject")
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    ax.bar(list(avg.keys()), list(avg.values()), color="#4C72B0")
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("Marks")
-    plt.xticks(rotation=20, ha="right")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
 
+    # ---- 1. Show a table with averages ----
+    st.subheader("Average Marks by Subject")
+    avg_df = pd.DataFrame(list(avg.items()), columns=["Subject", "Average Marks"])
+    st.dataframe(avg_df, use_container_width=True, hide_index=True)
+
+    # ---- 2. Horizontal bar chart ----
+    fig1, ax1 = plt.subplots(figsize=(8, max(4, len(avg) * 0.5)))
+    subjects = list(avg.keys())
+    values = list(avg.values())
+    sorted_pairs = sorted(zip(values, subjects), reverse=True)
+    values, subjects = zip(*sorted_pairs) if sorted_pairs else ([], [])
+    bars = ax1.barh(subjects, values, color="#4C72B0")
+    ax1.set_xlim(0, 100)
+    ax1.set_xlabel("Average Marks")
+    for bar, val in zip(bars, values):
+        ax1.text(bar.get_width() + 1, bar.get_y() + bar.get_height()/2,
+                f"{val:.1f}", va='center', fontsize=9)
+    fig1.tight_layout()
+    st.pyplot(fig1)
+
+    # ---- 3. AI Career readiness ----
     ai_plan = ai_summary = None
+    fig2 = None
     if student.get("career_id"):
         cuts = db.get_career_cutoffs(student["career_id"])
         if cuts:
@@ -492,22 +639,55 @@ def render_student_chart_and_ai(student, year_filter=None):
             ai_summary = ai_advisor.overall_summary(ai_plan)
             st.subheader(f"AI Career-Readiness — {student.get('career_name', '')}")
             st.info(ai_summary)
-            fig2, ax2 = plt.subplots(figsize=(7, 3.5))
+
+            # Horizontal bar chart for plan
+            fig2, ax2 = plt.subplots(figsize=(8, max(4, len(ai_plan) * 0.5)))
             labels = [p["subject"] for p in ai_plan]
-            x = range(len(labels))
-            w = 0.35
-            ax2.bar([i - w/2 for i in x], [p["current"] for p in ai_plan], w, label="Student", color="#4C72B0")
-            ax2.bar([i + w/2 for i in x], [p["cutoff"] for p in ai_plan], w, label="Cutoff", color="#DD8452")
-            ax2.set_xticks(list(x))
-            ax2.set_xticklabels(labels, rotation=20, ha="right")
-            ax2.set_ylim(0, 100)
+            current = [p["current"] for p in ai_plan]
+            cutoffs = [p["cutoff"] for p in ai_plan]
+            y_pos = range(len(labels))
+            bar_width = 0.35
+            ax2.barh([i - bar_width/2 for i in y_pos], current, height=bar_width,
+                     label="Student", color="#4C72B0")
+            ax2.barh([i + bar_width/2 for i in y_pos], cutoffs, height=bar_width,
+                     label="Cutoff", color="#DD8452")
+            ax2.set_yticks(y_pos)
+            ax2.set_yticklabels(labels)
+            ax2.set_xlim(0, 100)
             ax2.legend()
             fig2.tight_layout()
             st.pyplot(fig2)
-            plt.close(fig2)
+
+            # Status messages
             for p in ai_plan:
                 icon = {"On Track": "✅", "Almost There": "🟡", "Needs Improvement": "🟠", "Critical": "🔴"}[p["status"]]
                 st.write(f"{icon} **{p['subject']}** — {p['message']}")
+
+    # ---- 4. PDF Download Button (only if reportlab is available) ----
+    if REPORTLAB_AVAILABLE:
+        if st.button("📄 Download Performance Report (PDF)", key="pdf_btn"):
+            with st.spinner("Generating PDF..."):
+                try:
+                    pdf_bytes = generate_student_pdf(student, avg, ai_plan, ai_summary, fig1, fig2)
+                    st.download_button(
+                        label="⬇️ Click to download",
+                        data=pdf_bytes,
+                        file_name=f"{student['reg_no']}_performance_report.pdf",
+                        mime="application/pdf",
+                        key="pdf_download"
+                    )
+                    st.success("PDF ready for download!")
+                except Exception as e:
+                    st.error(f"Could not generate PDF: {e}")
+    else:
+        st.warning("📄 PDF report generation is disabled because 'reportlab' is not installed. "
+                   "Run `pip install reportlab` to enable this feature.")
+
+    # Close figures to free memory
+    plt.close(fig1)
+    if fig2:
+        plt.close(fig2)
+
     return ai_plan, ai_summary
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1027,6 +1207,88 @@ def render_user_management():
                         st.error("❌ Could not delete user.")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ADD / UPDATE STUDENT (shared for Admin & Teacher)
+# ──────────────────────────────────────────────────────────────────────────────
+def render_add_update_student():
+    st.header("➕ Add / Update Student")
+    st.caption("Select an existing student to edit, or choose 'Add new student' to create a new record.")
+
+    # Get all required data
+    streams = db.get_streams()
+    stream_names = [s["name"] for s in streams]
+    all_students = db.get_all_students()
+
+    # Build options for selectbox
+    student_options = ["Add new student"]
+    student_options.extend([f"{s['reg_no']} - {s['name']}" for s in all_students])
+
+    selected_label = st.selectbox("Select student", student_options)
+
+    # Determine if we are editing an existing student
+    selected_student = None
+    if selected_label != "Add new student":
+        reg_no = selected_label.split(" - ")[0]
+        selected_student = next((s for s in all_students if s['reg_no'] == reg_no), None)
+
+    # Get default values
+    default_reg = selected_student['reg_no'] if selected_student else ""
+    default_name = selected_student['name'] if selected_student else ""
+    default_grade = selected_student['grade'] if selected_student else db.GRADES[0]
+    default_class = selected_student['class_section'] if selected_student else "A"
+    default_stream = selected_student.get('stream_name') if selected_student else stream_names[0] if stream_names else ""
+    default_career = selected_student.get('career_name') if selected_student else "-- none --"
+
+    # If student has a stream, filter careers; otherwise use first stream
+    if selected_student and selected_student.get('stream_id'):
+        default_stream_id = selected_student['stream_id']
+    else:
+        # if no stream, default to first stream if available
+        default_stream_id = streams[0]['id'] if streams else None
+
+    # Stream selection
+    if stream_names:
+        stream_choice = st.selectbox("Stream", stream_names, index=stream_names.index(default_stream) if default_stream in stream_names else 0)
+        stream_id = db.get_stream_id(stream_choice)
+        careers = db.get_careers_by_stream(stream_id)
+        career_names = ["-- none --"] + [c["name"] for c in careers]
+    else:
+        stream_choice = None
+        stream_id = None
+        careers = []
+        career_names = ["-- none --"]
+
+    # Grade and Class
+    grade_choice = st.selectbox("Grade", [f"Grade {g}" for g in db.GRADES],
+                                index=db.GRADES.index(default_grade) if default_grade in db.GRADES else 0)
+    class_choice = st.selectbox("Class Section", list("ABCDEFGH"),
+                                index=list("ABCDEFGH").index(default_class) if default_class in "ABCDEFGH" else 0)
+    grade_val = int(grade_choice.split()[1])
+
+    # Career selection
+    career_choice = st.selectbox("Career Dream", career_names,
+                                 index=career_names.index(default_career) if default_career in career_names else 0)
+
+    # Registration No and Name (editable)
+    reg_no = st.text_input("Registration Number", value=default_reg)
+    name = st.text_input("Student Name", value=default_name)
+
+    # Save button
+    if st.button("💾 Save Student", type="primary"):
+        if reg_no.strip() and name.strip():
+            cid = None
+            if career_choice != "-- none --":
+                # find career id
+                career_obj = next((c for c in careers if c["name"] == career_choice), None)
+                if career_obj:
+                    cid = career_obj["id"]
+            # Upsert student
+            db.upsert_student(reg_no.strip(), name.strip(), grade_val, class_choice, stream_id, cid)
+            st.success(f"✅ Student {reg_no} saved successfully!")
+            st.rerun()
+        else:
+            st.error("❌ Registration Number and Name are required.")
+
+# ──────────────────────────────────────────────────────────────────────────────
 # ADMIN DASHBOARD
 # ──────────────────────────────────────────────────────────────────────────────
 def admin_dashboard():
@@ -1189,6 +1451,8 @@ def admin_dashboard():
         render_delete_student()
     elif page == "🗑️ Delete Students Bulk":
         render_bulk_delete_students()
+    else:
+        st.error("Unknown page")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TEACHER DASHBOARD
@@ -1213,32 +1477,7 @@ def teacher_dashboard():
     stream_names = [s["name"] for s in streams]
 
     if page == "➕ Add / Update Student":
-        st.header("Add / Update Student")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            stream_choice = st.selectbox("Stream", stream_names, key="stu_s")
-        with c2:
-            grade_choice = st.selectbox("Grade", [f"Grade {g}" for g in db.GRADES], key="stu_g")
-        with c3:
-            class_choice = st.selectbox("Class Section", list("ABCDEFGH"), key="stu_c")
-        stream_id = db.get_stream_id(stream_choice)
-        grade_val = int(grade_choice.split()[1])
-        careers = db.get_careers_by_stream(stream_id)
-        with st.form(f"stu_form_{st.session_state.form_key}"):
-            reg_no = st.text_input("Registration Number")
-            name = st.text_input("Student Name")
-            career_choice = st.selectbox("Career Dream", ["-- none --"] + [c["name"] for c in careers])
-            if st.form_submit_button("Save Student"):
-                if reg_no.strip() and name.strip():
-                    cid = None
-                    if career_choice != "-- none --":
-                        cid = next(c["id"] for c in careers if c["name"] == career_choice)
-                    db.upsert_student(reg_no.strip(), name.strip(), grade_val, class_choice, stream_id, cid)
-                    st.success("✅ Student saved successfully!")
-                    reset_form()
-                    st.rerun()
-                else:
-                    st.error("❌ Reg No and Name required.")
+        render_add_update_student()   # shared function
     elif page == "📤 Bulk Upload Marks":
         render_upload_page()
     elif page == "📝 Enter Marks":
