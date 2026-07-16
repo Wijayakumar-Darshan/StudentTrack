@@ -50,6 +50,9 @@ from fpdf.enums import XPos, YPos   # for new cell syntax
 FPDF_AVAILABLE = True
 
 load_dotenv()
+print("Current working directory:", os.getcwd())
+print("DATABASE_URL exists?", os.getenv("DATABASE_URL") is not None)
+print("DATABASE_URL value:", os.getenv("DATABASE_URL"))
 
 SECRET_KEY = os.getenv(
     "JWT_SECRET",
@@ -1235,17 +1238,19 @@ def render_delete_marks():
                 db.run_query(delete_query, (grade, year))
                 st.success(f"✅ Successfully deleted all marks for Grade {grade} in {year}.")
                 st.session_state.refresh_delete = True
+                st.cache_data.clear()
+                st.rerun()
             except Exception as e:
                 st.error(f"❌ Error during deletion: {e}")
     else:
         st.info("Please confirm the deletion checkbox above to enable the delete button.")
 
 # =============================================================================
-# ADMIN: DELETE SINGLE STUDENT
+# ADMIN: DELETE SINGLE STUDENT (with orphaned career deletion)
 # =============================================================================
 def render_delete_student():
     st.header("🗑️ Delete Student (Permanent)")
-    st.caption("Select a student to permanently delete their record and all associated marks. This action cannot be undone.")
+    st.caption("Select a student to permanently delete their record and all associated marks. If the student's career is not used by any other student, it will also be deleted.")
 
     students = cached_get_all_students()
     if not students:
@@ -1288,22 +1293,39 @@ def render_delete_student():
 
     if confirm:
         if st.button("🗑️ Delete Student Permanently", type="primary"):
+            career_id = student_data.get('career_id')
             try:
+                # Delete marks and student
                 db.run_query("DELETE FROM marks WHERE reg_no = ?", (reg_no,))
                 db.run_query("DELETE FROM students WHERE reg_no = ?", (reg_no,))
+
+                # If the student had a career, check if any other student uses it; if not, delete it
+                if career_id:
+                    # Count remaining students with this career
+                    count_query = "SELECT COUNT(*) as cnt FROM students WHERE career_id = ?"
+                    result = db.run_query(count_query, (career_id,), fetch=True)
+                    remaining = result[0]["cnt"] if result else 0
+                    if remaining == 0:
+                        db.delete_career(career_id)
+                        st.info(f"Career '{student_data.get('career_name', '')}' was orphaned and has been deleted.")
+                    else:
+                        st.info(f"Career '{student_data.get('career_name', '')}' is still used by other students, so it was not deleted.")
+
                 st.success(f"✅ Successfully deleted student {student_data['name']} and all their marks.")
                 st.session_state.refresh_delete = True
+                st.cache_data.clear()
+                st.rerun()
             except Exception as e:
                 st.error(f"❌ Error during deletion: {e}")
     else:
         st.info("Please confirm the deletion checkbox above to enable the delete button.")
 
 # =============================================================================
-# ADMIN: BULK DELETE STUDENTS BY GRADE & YEAR
+# ADMIN: BULK DELETE STUDENTS BY GRADE & YEAR (with orphaned career deletion)
 # =============================================================================
 def render_bulk_delete_students():
     st.header("🗑️ Delete Students (Bulk) by Grade & Year")
-    st.caption("Permanently delete all students who have marks in the selected grade and year. This also removes all their marks.")
+    st.caption("Permanently delete all students who have marks in the selected grade and year. This also removes all their marks and any careers that become orphaned.")
 
     grades = db.GRADES
     years = [row["year"] for row in db.run_query("SELECT DISTINCT year FROM marks ORDER BY year DESC", fetch=True)]
@@ -1335,7 +1357,7 @@ def render_bulk_delete_students():
         return
 
     sample_query = """
-        SELECT DISTINCT s.reg_no, s.name, s.grade, s.class_section
+        SELECT DISTINCT s.reg_no, s.name, s.grade, s.class_section, s.career_id
         FROM students s
         JOIN marks m ON s.reg_no = m.reg_no
         WHERE s.grade = ? AND m.year = ?
@@ -1353,24 +1375,50 @@ def render_bulk_delete_students():
     if confirm:
         if st.button("🗑️ Delete All Students and Marks", type="primary"):
             try:
+                # Get all reg_no and their career_ids
                 regs_query = """
-                    SELECT DISTINCT s.reg_no
+                    SELECT DISTINCT s.reg_no, s.career_id
                     FROM students s
                     JOIN marks m ON s.reg_no = m.reg_no
                     WHERE s.grade = ? AND m.year = ?
                 """
                 regs = db.run_query(regs_query, (grade, year), fetch=True)
                 reg_list = [r["reg_no"] for r in regs]
+                career_ids = {r["career_id"] for r in regs if r["career_id"] is not None}
+
                 if not reg_list:
                     st.info("No students found.")
                     return
+
                 placeholders = ','.join(['?'] * len(reg_list))
+
+                # Delete marks
                 delete_marks_query = f"DELETE FROM marks WHERE reg_no IN ({placeholders})"
                 db.run_query(delete_marks_query, reg_list)
+
+                # Delete students
                 delete_students_query = f"DELETE FROM students WHERE reg_no IN ({placeholders})"
                 db.run_query(delete_students_query, reg_list)
+
+                # For each career_id, check if any student still uses it; if not, delete it
+                deleted_careers = []
+                for cid in career_ids:
+                    if cid is None:
+                        continue
+                    count_career_query = "SELECT COUNT(*) as cnt FROM students WHERE career_id = ?"
+                    res = db.run_query(count_career_query, (cid,), fetch=True)
+                    if res and res[0]["cnt"] == 0:
+                        # Delete career (cascades cutoffs)
+                        db.delete_career(cid)
+                        deleted_careers.append(cid)
+
+                if deleted_careers:
+                    st.info(f"Deleted {len(deleted_careers)} orphaned career(s).")
+
                 st.success(f"✅ Successfully deleted {student_count} students and {mark_count} marks for Grade {grade} in {year}.")
                 st.session_state.refresh_delete = True
+                st.cache_data.clear()
+                st.rerun()
             except Exception as e:
                 st.error(f"❌ Error during deletion: {e}")
     else:
@@ -1788,7 +1836,6 @@ def teacher_dashboard():
                 df = clean_dataframe(pd.DataFrame(mrows)[["subject_name", "marks"]])
                 # Show table
                 st.dataframe(df, use_container_width=True, hide_index=True)
-
 
                 # PDF download (new)
                 if st.button(f"📄 Download Term {term} Marks (PDF)", key="pdf_term"):
